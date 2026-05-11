@@ -2,9 +2,9 @@ Import-Module Microsoft.Graph.Users
 Import-Module ImportExcel
 
 # Connect to Graph 
-$TenantId = "b5db11ac-8f37-4109-a146-5d7a302f5881"
-$ClientId = "27b823ed-3629-42c2-8a47-4bd5e734a8a1"
-$ClientSecret = "4oJ8Q~6K6wklriRHVxG~528OWqrdenhqK2PcIciz"
+$TenantId = "Your tenant id"
+$ClientId = "Your client id"
+$ClientSecret = "Your client secret"
 
 $SecureSecret = ConvertTo-SecureString $ClientSecret -AsPlainText -Force
 $Credential = New-Object System.Management.Automation.PSCredential($ClientId, $SecureSecret)
