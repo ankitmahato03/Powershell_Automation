@@ -13,17 +13,26 @@
 #   chmod +x setup-kvm-host.sh
 #   sudo ./setup-kvm-host.sh
 #
-# Override the defaults for your network like this:
+# By default the bridge reuses the NIC's current IP, gateway and DNS.
+# Run it from the local console, or inside tmux/screen if you use SSH.
+# Override the detected values for your network like this:
 #   sudo env HOST_IP=192.168.1.5 GATEWAY=192.168.1.1 DNS=192.168.1.1 ./setup-kvm-host.sh
 
 set -euo pipefail
 
-HOST_IP=${HOST_IP:-192.168.10.5}
-PREFIX=${PREFIX:-24}
-GATEWAY=${GATEWAY:-192.168.10.1}
-DNS=${DNS:-192.168.10.1}
-NIC=${NIC:-$(ip -o route show default | awk '{print $5; exit}')}
 BRIDGE=br0
+NIC=${NIC:-$(ip -o route show default | awk '{print $5; exit}')}
+
+# Default to the NIC's CURRENT address, gateway and DNS so the host keeps the
+# same IP after the bridge is created (prevents losing SSH / network access).
+CUR_CIDR=$( [ -n "$NIC" ] && ip -o -4 addr show dev "$NIC" 2> /dev/null | awk '{print $4; exit}' || true)
+CUR_GW=$(ip -o route show default 2> /dev/null | awk '{print $3; exit}' || true)
+CUR_DNS=$( [ -n "$NIC" ] && resolvectl dns "$NIC" 2> /dev/null | awk '{print $4; exit}' || true)
+
+HOST_IP=${HOST_IP:-${CUR_CIDR%/*}}
+PREFIX=${PREFIX:-${CUR_CIDR#*/}}
+GATEWAY=${GATEWAY:-$CUR_GW}
+DNS=${DNS:-${CUR_DNS:-$GATEWAY}}
 IMG_DIR=/var/lib/libvirt/images
 IMG_URL=https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img
 IMG_FILE=$IMG_DIR/noble-server-cloudimg-amd64.img
@@ -71,6 +80,25 @@ else
     die "$NIC is a Wi-Fi interface, which cannot be bridged. Use a wired connection."
   fi
 
+  [ -n "$HOST_IP" ] && [ -n "$PREFIX" ] && [ -n "$GATEWAY" ] && [ -n "$DNS" ] || \
+    die "Could not detect the network settings of $NIC. Re-run with HOST_IP=, PREFIX=, GATEWAY= and DNS= set."
+
+  if systemctl is-active --quiet NetworkManager; then
+    echo "WARNING: NetworkManager is running. This script configures the bridge with systemd-networkd."
+    echo "         On Ubuntu Desktop, create the bridge with nmcli instead, or disable NetworkManager first."
+  fi
+
+  echo "Bridge settings:"
+  echo "  NIC      : $NIC"
+  echo "  Bridge   : $BRIDGE"
+  echo "  Host IP  : $HOST_IP/$PREFIX   (current: ${CUR_CIDR:-none})"
+  echo "  Gateway  : $GATEWAY"
+  echo "  DNS      : $DNS"
+  if [ -t 0 ]; then
+    read -r -p "Continue with these settings? [y/N] " ans
+    [[ "$ans" =~ ^[Yy]$ ]] || die "Aborted. Re-run with NIC=, HOST_IP=, PREFIX=, GATEWAY=, DNS= to change them."
+  fi
+
   BACKUP=/root/netplan-backup-$(date +%F-%H%M%S)
   mkdir -p "$BACKUP"
   shopt -s nullglob
@@ -78,6 +106,17 @@ else
     mv "$f" "$BACKUP/"
   done
   shopt -u nullglob
+
+  restore_network() {
+    echo "Restoring the previous network settings from $BACKUP."
+    rm -f /etc/netplan/01-bridge.yaml
+    shopt -s nullglob
+    for f in "$BACKUP"/*.yaml; do mv "$f" /etc/netplan/; done
+    shopt -u nullglob
+    ip link set "$BRIDGE" down 2> /dev/null || true
+    ip link delete "$BRIDGE" type bridge 2> /dev/null || true
+    netplan apply || true
+  }
 
   cat > /etc/netplan/01-bridge.yaml <<EOF
 network:
@@ -100,15 +139,40 @@ network:
 EOF
   chmod 600 /etc/netplan/01-bridge.yaml
 
-  echo "Applying with 'netplan try'. Press ENTER to confirm when asked."
-  echo "If you are connected over SSH and the connection drops, wait 2 minutes: the old settings come back."
-  if ! netplan try --timeout 120; then
-    echo "Bridge change was not confirmed. Restoring the previous network settings."
-    rm -f /etc/netplan/01-bridge.yaml
-    mv "$BACKUP"/*.yaml /etc/netplan/
-    netplan apply
-    die "The bridge was not set up."
+  # Validate the YAML before touching the live network.
+  if ! netplan generate; then
+    restore_network
+    die "The generated netplan config is invalid (see the error above). The bridge was not set up."
   fi
+
+  APPLIED=no
+  if [ -t 0 ]; then
+    echo "Applying with 'netplan try'. Press ENTER to confirm when asked."
+    echo "If you are connected over SSH and the connection drops, wait 2 minutes: the old settings come back."
+    if netplan try --timeout 120; then
+      APPLIED=yes
+    else
+      echo "'netplan try' failed or was not confirmed (some netplan versions refuse to try bridge changes)."
+    fi
+  fi
+
+  # Fallback: apply directly, then roll back automatically if the gateway is unreachable.
+  if [ "$APPLIED" = no ]; then
+    echo "Applying with 'netplan apply' and checking connectivity..."
+    netplan apply || true
+    for _ in $(seq 1 15); do
+      ip -4 addr show dev "$BRIDGE" 2> /dev/null | grep -q "$HOST_IP/" && ping -c1 -W2 "$GATEWAY" > /dev/null 2>&1 && { APPLIED=yes; break; }
+      sleep 2
+    done
+  fi
+
+  if [ "$APPLIED" = no ] || ! ip -4 addr show dev "$BRIDGE" 2> /dev/null | grep -q "$HOST_IP/"; then
+    restore_network
+    die "The bridge was not set up: $BRIDGE did not come up with $HOST_IP or the gateway $GATEWAY was unreachable."
+  fi
+
+  echo "$BRIDGE is up with $HOST_IP/$PREFIX."
+  bridge link 2> /dev/null | grep "$BRIDGE" || true
 fi
 
 # ---------------------------------------------------------- 5. cloud image
@@ -132,7 +196,7 @@ set -euo pipefail
 [ "$#" -eq 6 ] || { echo "Usage: create-vm NAME IP DNS_IP RAM_MB VCPUS DISK_GB"; exit 1; }
 
 NAME=$1; IP=$2; DNS=$3; RAM=$4; CPUS=$5; DISK=$6
-DOMAIN=${DOMAIN:-ad.example.com}
+DOMAIN=${DOMAIN:-ad.ankinfo.online}
 GATEWAY=${GATEWAY:-192.168.10.1}
 IMG=/var/lib/libvirt/images
 BASE=$IMG/noble-server-cloudimg-amd64.img
